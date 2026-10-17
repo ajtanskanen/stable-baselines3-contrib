@@ -7,7 +7,7 @@ from stable_baselines3.common.envs import SimpleMultiObsEnv
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecNormalize
 
-from sb3_contrib import QRDQN, TQC, TRPO
+from sb3_contrib import ACKTR, QRDQN, TQC, TRPO
 
 
 class DummyDictEnv(gym.Env):
@@ -87,7 +87,7 @@ def test_env(use_discrete_actions, channel_last, nested_dict_obs, vec_only):
         check_env(DummyDictEnv(use_discrete_actions, channel_last, nested_dict_obs, vec_only))
 
 
-@pytest.mark.parametrize("model_class", [QRDQN, TQC, TRPO])
+@pytest.mark.parametrize("model_class", [QRDQN, TQC, TRPO, ACKTR])
 def test_consistency(model_class):
     """
     Make sure that dict obs with vector only vs using flatten obs is equivalent.
@@ -100,13 +100,15 @@ def test_consistency(model_class):
     obs, _ = dict_env.reset(seed=10)
 
     kwargs = {}
-    n_steps = 128
+    n_steps = 256
 
     if model_class in {TRPO}:
         kwargs = dict(
-            n_steps=64,
-            batch_size=64,
+            n_steps=128,
         )
+    elif model_class == ACKTR:
+        # ACKTR takes its trunk as constructor arguments, not via policy_kwargs
+        kwargs = dict(net_arch=(32,))
     else:
         # Avoid memory error when using replay buffer
         # Reduce the size of the features and make learning faster
@@ -133,7 +135,7 @@ def test_consistency(model_class):
     assert np.allclose(action_1, action_2)
 
 
-@pytest.mark.parametrize("model_class", [QRDQN, TQC, TRPO])
+@pytest.mark.parametrize("model_class", [QRDQN, TQC, TRPO, ACKTR])
 @pytest.mark.parametrize("channel_last", [False, True])
 def test_dict_spaces(model_class, channel_last):
     """
@@ -145,25 +147,26 @@ def test_dict_spaces(model_class, channel_last):
     env = gym.wrappers.TimeLimit(env, 100)
 
     kwargs = {}
-    n_steps = 128
+    n_steps = 256
 
     if model_class in {TRPO}:
         kwargs = dict(
-            n_steps=64,
-            batch_size=64,
+            n_steps=128,
             policy_kwargs=dict(
-                net_arch=dict(pi=[8], vf=[8]),
-                features_extractor_kwargs=dict(cnn_output_dim=8),
+                net_arch=dict(pi=[32], vf=[32]),
+                features_extractor_kwargs=dict(cnn_output_dim=32),
             ),
         )
+    elif model_class == ACKTR:
+        kwargs = dict(net_arch=(32,), features_extractor_kwargs=dict(cnn_output_dim=32))
     else:
         # Avoid memory error when using replay buffer
         # Reduce the size of the features and make learning faster
         kwargs = dict(
             buffer_size=250,
             policy_kwargs=dict(
-                net_arch=[8],
-                features_extractor_kwargs=dict(cnn_output_dim=8),
+                net_arch=[32],
+                features_extractor_kwargs=dict(cnn_output_dim=32),
                 n_quantiles=20,
             ),
             train_freq=8,
@@ -179,7 +182,7 @@ def test_dict_spaces(model_class, channel_last):
     evaluate_policy(model, env, n_eval_episodes=5, warn=False)
 
 
-@pytest.mark.parametrize("model_class", [QRDQN, TQC, TRPO])
+@pytest.mark.parametrize("model_class", [QRDQN, TQC, TRPO, ACKTR])
 @pytest.mark.parametrize("channel_last", [False, True])
 def test_dict_vec_framestack(model_class, channel_last):
     """
@@ -195,26 +198,27 @@ def test_dict_vec_framestack(model_class, channel_last):
     env = VecFrameStack(env, n_stack=3, channels_order=channels_order)
 
     kwargs = {}
-    n_steps = 128
+    n_steps = 256
 
     if model_class in {TRPO}:
         kwargs = dict(
-            n_steps=64,
-            batch_size=64,
+            n_steps=128,
             policy_kwargs=dict(
-                net_arch=dict(pi=[8], vf=[8]),
-                features_extractor_kwargs=dict(cnn_output_dim=8),
+                net_arch=dict(pi=[32], vf=[32]),
+                features_extractor_kwargs=dict(cnn_output_dim=32),
             ),
         )
+    elif model_class == ACKTR:
+        kwargs = dict(net_arch=(32,), features_extractor_kwargs=dict(cnn_output_dim=32))
     else:
         # Avoid memory error when using replay buffer
         # Reduce the size of the features and make learning faster
         kwargs = dict(
             buffer_size=250,
             policy_kwargs=dict(
-                net_arch=[8],
-                features_extractor_kwargs=dict(cnn_output_dim=8),
-                n_quantiles=10,
+                net_arch=[32],
+                features_extractor_kwargs=dict(cnn_output_dim=32),
+                n_quantiles=20,
             ),
             train_freq=8,
             gradient_steps=1,
@@ -229,7 +233,7 @@ def test_dict_vec_framestack(model_class, channel_last):
     evaluate_policy(model, env, n_eval_episodes=5, warn=False)
 
 
-@pytest.mark.parametrize("model_class", [QRDQN, TQC, TRPO])
+@pytest.mark.parametrize("model_class", [QRDQN, TQC, TRPO, ACKTR])
 def test_vec_normalize(model_class):
     """
     Additional tests to check observation space support
@@ -239,23 +243,24 @@ def test_vec_normalize(model_class):
     env = VecNormalize(env, norm_obs_keys=["vec"])
 
     kwargs = {}
-    n_steps = 128
+    n_steps = 256
 
     if model_class in {TRPO}:
         kwargs = dict(
-            n_steps=64,
-            batch_size=64,
+            n_steps=128,
             policy_kwargs=dict(
-                net_arch=dict(pi=[8], vf=[8]),
+                net_arch=dict(pi=[32], vf=[32]),
             ),
         )
+    elif model_class == ACKTR:
+        kwargs = dict(net_arch=(32,))
     else:
         # Avoid memory error when using replay buffer
         # Reduce the size of the features and make learning faster
         kwargs = dict(
             buffer_size=250,
             policy_kwargs=dict(
-                net_arch=[8],
+                net_arch=[32],
             ),
             train_freq=8,
             gradient_steps=1,

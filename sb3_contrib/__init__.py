@@ -1,6 +1,7 @@
 import os
 
 from sb3_contrib.ars import ARS
+from sb3_contrib.acktr import ACKTR
 from sb3_contrib.crossq import CrossQ
 from sb3_contrib.ppo_mask import MaskablePPO
 from sb3_contrib.ppo_recurrent import RecurrentPPO
@@ -15,6 +16,7 @@ with open(version_file) as file_handler:
 
 __all__ = [
     "ARS",
+    "ACKTR",
     "QRDQN",
     "TQC",
     "TRPO",

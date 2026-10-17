@@ -13,9 +13,9 @@ from stable_baselines3.common.envs import FakeImageEnv, IdentityEnv, IdentityEnv
 from stable_baselines3.common.utils import get_device
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from sb3_contrib import ARS, QRDQN, TQC, TRPO, CrossQ
+from sb3_contrib import ACKTR, ARS, QRDQN, TQC, TRPO, CrossQ
 
-MODEL_LIST = [ARS, QRDQN, TQC, TRPO, CrossQ]
+MODEL_LIST = [ARS, QRDQN, TQC, TRPO, CrossQ, ACKTR]
 
 
 def rand_like(tensor: th.Tensor) -> th.Tensor:
@@ -23,6 +23,23 @@ def rand_like(tensor: th.Tensor) -> th.Tensor:
         return th.rand_like(tensor)
     # int tensor
     return th.randint_like(tensor, high=10)
+
+
+def adapt_kwargs(model_class: type[BaseAlgorithm], kwargs: dict) -> dict:
+    """
+    ACKTR takes its trunk (net_arch, features_extractor_kwargs) as constructor
+    arguments and rejects them in policy_kwargs.
+    """
+    if model_class is not ACKTR:
+        return kwargs
+    kwargs = deepcopy(kwargs)
+    policy_kwargs = kwargs.pop("policy_kwargs", {})
+    for key in ("net_arch", "features_extractor_kwargs"):
+        if key in policy_kwargs:
+            kwargs[key] = policy_kwargs.pop(key)
+    if policy_kwargs:
+        kwargs["policy_kwargs"] = policy_kwargs
+    return kwargs
 
 
 def select_env(model_class: BaseAlgorithm) -> gym.Env:
@@ -36,7 +53,7 @@ def select_env(model_class: BaseAlgorithm) -> gym.Env:
 
 
 @pytest.mark.parametrize("model_class", MODEL_LIST)
-def test_save_load(tmp_path, model_class):  # noqa: C901
+def test_save_load(tmp_path, model_class):
     """
     Test if 'save' and 'load' saves and loads model correctly
     and if 'get_parameters' and 'set_parameters' and work correctly.
@@ -48,20 +65,14 @@ def test_save_load(tmp_path, model_class):  # noqa: C901
 
     env = DummyVecEnv([lambda: select_env(model_class)])
 
-    kwargs = {}
-    policy_kwargs = dict(net_arch=[8])
+    policy_kwargs = dict(net_arch=[16])
 
     if model_class in {QRDQN, TQC}:
-        policy_kwargs.update(dict(n_quantiles=10))
+        policy_kwargs.update(dict(n_quantiles=20))
 
-    if model_class in {QRDQN, TQC, CrossQ}:
-        kwargs = dict(buffer_size=256, train_freq=2)
-
-    if model_class in {TRPO}:
-        kwargs = dict(n_steps=256)
     # create model
-    model = model_class("MlpPolicy", env, verbose=1, policy_kwargs=policy_kwargs, **kwargs)
-    model.learn(total_timesteps=128)
+    model = model_class("MlpPolicy", env, verbose=1, **adapt_kwargs(model_class, dict(policy_kwargs=policy_kwargs)))
+    model.learn(total_timesteps=300)
 
     env.reset()
     observations = np.concatenate([env.step([env.action_space.sample()])[0] for _ in range(10)], axis=0)
@@ -196,7 +207,7 @@ def test_set_env(model_class):
         kwargs["policy_kwargs"].update(dict(n_quantiles=20))
 
     # create model
-    model = model_class("MlpPolicy", env, **kwargs)
+    model = model_class("MlpPolicy", env, **adapt_kwargs(model_class, kwargs))
     # learn
     model.learn(total_timesteps=150)
 
@@ -221,7 +232,7 @@ def test_exclude_include_saved_params(tmp_path, model_class):
     env = DummyVecEnv([lambda: select_env(model_class)])
 
     # create model, set verbose as 2, which is not standard
-    model = model_class("MlpPolicy", env, policy_kwargs=dict(net_arch=[16]), verbose=2)
+    model = model_class("MlpPolicy", env, verbose=2, **adapt_kwargs(model_class, dict(policy_kwargs=dict(net_arch=[16]))))
 
     # Check if exclude works
     model.save(tmp_path / "test_save", exclude=["verbose"])
@@ -279,7 +290,7 @@ def test_save_load_policy(tmp_path, model_class, policy_str):
     :param model_class: (BaseAlgorithm) A RL model
     :param policy_str: (str) Name of the policy.
     """
-    kwargs = dict(policy_kwargs=dict(net_arch=[8]))
+    kwargs = dict(policy_kwargs=dict(net_arch=[16]))
 
     if policy_str == "CnnPolicy" and model_class in [ARS, CrossQ]:
         pytest.skip(f"{model_class.__name__} does not support CnnPolicy")
@@ -293,25 +304,24 @@ def test_save_load_policy(tmp_path, model_class, policy_str):
             kwargs = dict(
                 buffer_size=250,
                 learning_starts=100,
-                policy_kwargs=dict(features_extractor_kwargs=dict(features_dim=8)),
-                train_freq=2,
+                policy_kwargs=dict(features_extractor_kwargs=dict(features_dim=32)),
             )
         else:
             kwargs = dict(
                 n_steps=128,
-                policy_kwargs=dict(features_extractor_kwargs=dict(features_dim=8)),
+                policy_kwargs=dict(features_extractor_kwargs=dict(features_dim=32)),
             )
         env = FakeImageEnv(screen_height=40, screen_width=40, n_channels=2, discrete=model_class == QRDQN)
 
     # Reduce number of quantiles for faster tests
     if model_class in [TQC, QRDQN]:
-        kwargs["policy_kwargs"].update(dict(n_quantiles=10))
+        kwargs["policy_kwargs"].update(dict(n_quantiles=20))
 
     env = DummyVecEnv([lambda: env])
 
     # create model
-    model = model_class(policy_str, env, verbose=1, **kwargs)
-    model.learn(total_timesteps=128)
+    model = model_class(policy_str, env, verbose=1, **adapt_kwargs(model_class, kwargs))
+    model.learn(total_timesteps=300)
 
     env.reset()
     observations = np.concatenate([env.step([env.action_space.sample()])[0] for _ in range(10)], axis=0)
@@ -390,7 +400,7 @@ def test_save_load_q_net(tmp_path, model_class, policy_str):
     :param model_class: (BaseAlgorithm) A RL model
     :param policy_str: (str) Name of the policy.
     """
-    kwargs = dict(policy_kwargs=dict(net_arch=[8]))
+    kwargs = dict(policy_kwargs=dict(net_arch=[16]))
     if policy_str == "MlpPolicy":
         env = select_env(model_class)
     else:
@@ -400,19 +410,19 @@ def test_save_load_q_net(tmp_path, model_class, policy_str):
             kwargs = dict(
                 buffer_size=250,
                 learning_starts=100,
-                policy_kwargs=dict(features_extractor_kwargs=dict(features_dim=16)),
+                policy_kwargs=dict(features_extractor_kwargs=dict(features_dim=32)),
             )
         env = FakeImageEnv(screen_height=40, screen_width=40, n_channels=2, discrete=model_class == QRDQN)
 
     # Reduce number of quantiles for faster tests
     if model_class in [QRDQN]:
-        kwargs["policy_kwargs"].update(dict(n_quantiles=10))
+        kwargs["policy_kwargs"].update(dict(n_quantiles=20))
 
     env = DummyVecEnv([lambda: env])
 
     # create model
     model = model_class(policy_str, env, verbose=1, **kwargs)
-    model.learn(total_timesteps=128)
+    model.learn(total_timesteps=300)
 
     env.reset()
     observations = np.concatenate([env.step([env.action_space.sample()])[0] for _ in range(10)], axis=0)
@@ -462,8 +472,8 @@ def test_save_load_q_net(tmp_path, model_class, policy_str):
 
 
 def test_save_load_pytorch_var(tmp_path):
-    model = TQC("MlpPolicy", "Pendulum-v1", seed=3, policy_kwargs=dict(net_arch=[32], n_critics=1))
-    model.learn(128)
+    model = TQC("MlpPolicy", "Pendulum-v1", seed=3, policy_kwargs=dict(net_arch=[64], n_critics=1))
+    model.learn(200)
     save_path = str(tmp_path / "tqc_pendulum")
     model.save(save_path)
     env = model.get_env()
@@ -473,14 +483,14 @@ def test_save_load_pytorch_var(tmp_path):
 
     model = TQC.load(save_path, env=env)
     assert th.allclose(log_ent_coef_before, model.log_ent_coef)
-    model.learn(128)
+    model.learn(200)
     log_ent_coef_after = model.log_ent_coef
     # Check that the entropy coefficient is still optimized
     assert not th.allclose(log_ent_coef_before, log_ent_coef_after)
 
     # With a fixed entropy coef
-    model = TQC("MlpPolicy", "Pendulum-v1", seed=3, ent_coef=0.01, policy_kwargs=dict(net_arch=[32], n_critics=1))
-    model.learn(128)
+    model = TQC("MlpPolicy", "Pendulum-v1", seed=3, ent_coef=0.01, policy_kwargs=dict(net_arch=[64], n_critics=1))
+    model.learn(200)
     save_path = str(tmp_path / "tqc_pendulum")
     model.save(save_path)
     env = model.get_env()
