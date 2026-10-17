@@ -108,10 +108,12 @@ from stable_baselines3.common.utils import explained_variance
 
 SB2_AUDIT_VERSION = "v31-shared-network"
 
-# Suuret float32-matriisit CPU:lla reititetään SciPyn SYEVR-ajurille: PyTorchin
-# CPU-eigh käyttää LAPACKin SSYEVD:tä, jonka workspace-kysely on rikki juuri
-# NatureCNN:n kokoluokan (~3137x3137) matriiseilla.
-_SCIPY_EIGH_THRESHOLD = 2048
+# Kaikki CPU:lla hajotettavat float32-faktorit reititetään SciPyn SYEVR-ajurille.
+# PyTorchin CPU-eigh käyttää LAPACKin SSYEVD:tä, jonka workspace-kysely on rikki
+# NatureCNN:n kokoluokan (~3137x3137) matriiseilla, ja joka on myös pienillä
+# (64x64) lähes vajaarankaisilla K-FAC-faktoreilla moninkertaisesti SYEVR:ää
+# hitaampi. Torch-eigh jää varapoluksi. MPS-natiivi eigh ei käytä tätä rajaa.
+_SCIPY_EIGH_THRESHOLD = 1
 # Viimeisen keinon float64-eigh on O(n^3) CPU:lla; ei ajeta mielivaltaisen
 # suurille faktoreille.
 _DENSE_EIGH_FALLBACK_MAX_SIZE = 1024
@@ -789,10 +791,12 @@ class SB2KFACOptimizer(th.optim.Optimizer):
     ) -> tuple[th.Tensor, th.Tensor, str]:
         """Robusti ominaisarvohajotelma symmetriselle K-FAC-faktorille.
 
-        Suuria float32-matriiseja ei anneta CPU:lla torch.linalg.eigh:lle:
+        CPU:lla float32-matriiseja ei anneta ensisijaisesti torch.linalg.eigh:lle:
         PyTorchin CPU-polku käyttää LAPACKin SSYEVD:tä, jonka LWORK-kysely on
         useissa julkaisuissa raportoitu rikkinäiseksi juuri NatureCNN:n
-        tuottamalla kokoluokalla. SciPyn eigh(driver='evr') käyttää SYEVR-perhettä.
+        tuottamalla kokoluokalla, ja joka on lähes vajaarankaisilla pienillä
+        faktoreilla moninkertaisesti hitaampi. SciPyn eigh(driver='evr') käyttää
+        SYEVR-perhettä; torch-eigh on sen varapolku.
         """
         if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
             raise ValueError(

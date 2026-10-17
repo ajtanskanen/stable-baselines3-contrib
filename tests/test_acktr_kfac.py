@@ -852,12 +852,14 @@ def test_9_4_eigh_rejects_non_finite_input_unconditionally():
         opt._safe_symmetric_eigh(matrix, module=module, factor_name="A")
 
 
-def test_9_5_eigh_reconstructs_the_matrix_on_torch_cpu():
+def test_9_5_eigh_reconstructs_the_matrix_on_cpu_via_scipy():
     module = nn.Linear(6, 2, bias=False)
     opt = make_opt(module)
     A = spd(6, seed=1)
     vals, vecs, backend = opt._safe_symmetric_eigh(A, module=module, factor_name="A")
-    assert backend == "torch-cpu"
+    # Oletuksena kaikki CPU-faktorit kokoon katsomatta menevät SYEVR:lle.
+    assert backend == "scipy-evr"
+    assert vals.dtype == A.dtype and vecs.dtype == A.dtype
     rebuilt = (vecs * vals.unsqueeze(0)) @ vecs.t()
     assert th.allclose(rebuilt, A, atol=1e-3)
 
@@ -873,11 +875,11 @@ def test_9_6_eigh_symmetrises_the_input():
     assert th.allclose(vals, expected, atol=1e-3)
 
 
-def test_9_7_large_cpu_factors_are_routed_to_scipy_syevr(monkeypatch):
+def test_9_7_cpu_factors_are_routed_to_scipy_syevr(monkeypatch):
     module = nn.Linear(8, 2, bias=False)
     opt = make_opt(module)
     A = spd(8, seed=3)
-    monkeypatch.setattr(M, "_SCIPY_EIGH_THRESHOLD", 4)
+    assert M._SCIPY_EIGH_THRESHOLD <= 1
     vals, vecs, backend = opt._safe_symmetric_eigh(A, module=module, factor_name="A")
     assert backend == "scipy-evr"
     assert th.allclose((vecs * vals.unsqueeze(0)) @ vecs.t(), A, atol=1e-3)
@@ -980,7 +982,7 @@ def test_10_2_mature_statistics_produce_a_full_spectral_generation():
         state = opt.module_states[module]
         assert state.A_eigvecs is not None and state.G_eigvecs is not None
         assert state.A_eigvals.shape[0] == state.A.shape[0]
-    assert "torch-cpu" in opt.last_eigh_backend
+    assert "scipy-evr" in opt.last_eigh_backend
 
 
 def test_10_3_a_failing_module_keeps_the_previous_generation(monkeypatch):
