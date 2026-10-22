@@ -87,8 +87,9 @@ import functools
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence, Type, Union
+from typing import Any, Dict, NamedTuple, Optional, Sequence, Type, Union
 
+import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
@@ -103,10 +104,55 @@ from stable_baselines3.common.torch_layers import (
     FlattenExtractor,
     NatureCNN,
 )
+from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer
 from stable_baselines3.common.type_aliases import GymEnv, Schedule
 from stable_baselines3.common.utils import explained_variance
 
 SB2_AUDIT_VERSION = "v31-shared-network"
+
+
+class HeadMaskRolloutBufferSamples(NamedTuple):
+    observations: Any
+    actions: th.Tensor
+    old_values: th.Tensor
+    old_log_prob: th.Tensor
+    advantages: th.Tensor
+    returns: th.Tensor
+    head_masks: th.Tensor
+
+
+class _HeadMaskBufferMixin:
+    """Tallentaa MultiDiscrete-päiden relevanssimaskin jokaiselle askeleelle.
+
+    Maski (n_heads,) kertoo, vaikuttiko kunkin pään valinta ympäristöön tällä
+    askeleella. ACKTR täyttää sen ympäristön info-sanakirjasta ennen add()-kutsua;
+    oletus on 1 (kaikki päät relevantteja).
+    """
+
+    def __init__(self, *args, n_heads: int, **kwargs):
+        self.n_heads = int(n_heads)
+        super().__init__(*args, **kwargs)
+
+    def reset(self) -> None:
+        self.head_masks = np.ones((self.buffer_size, self.n_envs, self.n_heads), dtype=np.float32)
+        super().reset()
+
+    def get(self, batch_size: Optional[int] = None):
+        if not self.generator_ready:
+            self.head_masks = self.swap_and_flatten(self.head_masks)
+        yield from super().get(batch_size)
+
+    def _get_samples(self, batch_inds: np.ndarray, env=None) -> HeadMaskRolloutBufferSamples:
+        samples = super()._get_samples(batch_inds, env)
+        return HeadMaskRolloutBufferSamples(*samples, head_masks=self.to_torch(self.head_masks[batch_inds]))
+
+
+class HeadMaskRolloutBuffer(_HeadMaskBufferMixin, RolloutBuffer):
+    pass
+
+
+class HeadMaskDictRolloutBuffer(_HeadMaskBufferMixin, DictRolloutBuffer):
+    pass
 
 # Kaikki CPU:lla hajotettavat float32-faktorit reititetään SciPyn SYEVR-ajurille.
 # PyTorchin CPU-eigh käyttää LAPACKin SSYEVD:tä, jonka workspace-kysely on rikki
@@ -1538,8 +1584,14 @@ class ACKTR(A2C):
         # Rollout-tason äärellisyystarkistukset pakottavat host-device-synkronoinnin
         # joka askeleella. Kokonaistappio tarkistetaan aina.
         debug_finite_checks: bool = False,
+        # MultiDiscrete-päiden maskaus: ympäristö palauttaa info[head_mask_key]:ssä
+        # (n_heads,)-maskin siitä, mitkä päät vaikuttivat askeleeseen. Maskattujen
+        # päiden log-todennäköisyys ja entropia jätetään pois policy- ja
+        # Fisher-tappiosta. None = ei maskausta (SB2-käyttäytyminen).
+        head_mask_key: Optional[str] = None,
         _init_setup_model: bool = True,
     ):
+        self.head_mask_key = head_mask_key
         self.vf_fisher_coef = float(vf_fisher_coef)
         self.kfac_clip = float(kfac_clip)
         self.kfac_update = int(kfac_update)
@@ -1711,6 +1763,21 @@ class ACKTR(A2C):
         if isinstance(previous_optimizer, SB2KFACOptimizer):
             previous_optimizer.remove_hooks()
 
+        if self.head_mask_key is not None:
+            if not isinstance(self.action_space, spaces.MultiDiscrete):
+                raise ValueError(
+                    "head_mask_key requires a MultiDiscrete action space; "
+                    f"got {self.action_space}."
+                )
+            self.rollout_buffer_class = (
+                HeadMaskDictRolloutBuffer
+                if isinstance(self.observation_space, spaces.Dict)
+                else HeadMaskRolloutBuffer
+            )
+            self.rollout_buffer_kwargs = dict(
+                self.rollout_buffer_kwargs or {}, n_heads=len(self.action_space.nvec)
+            )
+
         super()._setup_model()
 
         if not isinstance(
@@ -1753,6 +1820,52 @@ class ACKTR(A2C):
     # ------------------------------------------------------------------
     # Koulutus
     # ------------------------------------------------------------------
+
+    def _update_info_buffer(self, infos, dones=None) -> None:
+        super()._update_info_buffer(infos, dones)
+        if self.head_mask_key is None:
+            return
+        # SB3 kutsuu tätä env.step():n jälkeen ja ennen rollout_buffer.add():ia,
+        # joten pos osoittaa juuri tämän askeleen riviin.
+        masks = []
+        for env_idx, info in enumerate(infos):
+            if self.head_mask_key not in info:
+                raise KeyError(
+                    f"head_mask_key={self.head_mask_key!r} is set but env {env_idx} "
+                    "did not return it in its info dict."
+                )
+            masks.append(np.asarray(info[self.head_mask_key], dtype=np.float32))
+        masks = np.stack(masks)
+        buffer = self.rollout_buffer
+        if masks.shape != (buffer.n_envs, buffer.n_heads):
+            raise ValueError(
+                f"info[{self.head_mask_key!r}] must have shape ({buffer.n_heads},) "
+                f"per env; got {masks.shape} for {buffer.n_envs} envs."
+            )
+        buffer.head_masks[buffer.pos] = masks
+
+    def _evaluate_actions_by_head(self, obs, actions: th.Tensor):
+        """Kuten ActorCriticPolicy.evaluate_actions, mutta log-todennäköisyys ja
+        entropia palautetaan MultiDiscrete-pääkohtaisina (batch, n_heads).
+
+        Yksi forward-pass, joten K-FAC-hookit näkevät jokaisen kerroksen kerran.
+        """
+        policy = self.policy
+        features = policy.extract_features(obs)
+        if policy.share_features_extractor:
+            latent_pi, latent_vf = policy.mlp_extractor(features)
+        else:
+            pi_features, vf_features = features
+            latent_pi = policy.mlp_extractor.forward_actor(pi_features)
+            latent_vf = policy.mlp_extractor.forward_critic(vf_features)
+        distribution = policy._get_action_dist_from_latent(latent_pi)
+        values = policy.value_net(latent_vf)
+        heads = distribution.distribution
+        log_prob = th.stack(
+            [head.log_prob(a) for head, a in zip(heads, th.unbind(actions, dim=1))], dim=1
+        )
+        entropy = th.stack([head.entropy() for head in heads], dim=1)
+        return values, log_prob, entropy
 
     def _prepare_actions(self, actions: th.Tensor) -> th.Tensor:
         if isinstance(self.action_space, spaces.Discrete):
@@ -1876,9 +1989,18 @@ class ACKTR(A2C):
             try:
                 # Yksi forward-graafi palvelee sekä Fisher-passia että
                 # actor-critic-lossia, kuten SB2:n TF-graafi.
-                values, log_prob, entropy = self.policy.evaluate_actions(
-                    rollout_data.observations, actions
-                )
+                if self.head_mask_key is not None:
+                    values, log_prob_heads, entropy_heads = self._evaluate_actions_by_head(
+                        rollout_data.observations, actions
+                    )
+                    head_masks = rollout_data.head_masks
+                    log_prob = (log_prob_heads * head_masks).sum(dim=1)
+                    entropy = (entropy_heads * head_masks).sum(dim=1)
+                    head_mask_means = head_masks.mean(dim=0)
+                else:
+                    values, log_prob, entropy = self.policy.evaluate_actions(
+                        rollout_data.observations, actions
+                    )
                 values = values.flatten()
                 self._require_training_finite(values, "value predictions")
                 self._require_training_finite(log_prob, "action log probabilities")
@@ -1990,6 +2112,9 @@ class ACKTR(A2C):
             "train/kfac_consecutive_refresh_failures",
             optimizer.consecutive_refresh_failures,
         )
+        if self.head_mask_key is not None and optimizer_steps > 0:
+            for head, share in enumerate(head_mask_means.tolist()):
+                record(f"train/head_{head}_active_share", share)
         if hasattr(self.policy, "log_std"):
             record("train/std", th.exp(self.policy.log_std).mean().item())
 
