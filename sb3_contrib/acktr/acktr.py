@@ -1589,6 +1589,11 @@ class ACKTR(A2C):
         # päiden log-todennäköisyys ja entropia jätetään pois policy- ja
         # Fisher-tappiosta. None = ei maskausta (SB2-käyttäytyminen).
         head_mask_key: Optional[str] = None,
+        # Advantagejen normalisointi (keskiarvo 0, keskihajonta 1) per rollout.
+        # None = SB2-käyttäytyminen: vain jatkuvalle (Box) action spacelle.
+        # True poistaa palkkioskaalan politiikkagradientista myös diskreeteille
+        # toiminnoille, jolloin kfac_clip-luottamusalue määrää askeleen koon.
+        normalize_advantage: Optional[bool] = None,
         _init_setup_model: bool = True,
     ):
         self.head_mask_key = head_mask_key
@@ -1689,8 +1694,7 @@ class ACKTR(A2C):
             # optimizer_kwargs-merkinnän policy_kwargsissa ja checkpointissa.
             use_rms_prop=False,
             use_sde=False,
-            # SB2 normalisoi advantaget vain jatkuvassa action spacessa, mikä
-            # tehdään train()-metodissa.
+            # Normalisointi tehdään train()-metodissa (ks. normalize_advantage).
             normalize_advantage=False,
             stats_window_size=stats_window_size,
             tensorboard_log=tensorboard_log,
@@ -1700,10 +1704,17 @@ class ACKTR(A2C):
             device=device,
             _init_setup_model=_init_setup_model,
         )
+        # A2C.__init__ asettaa attribuutin Falseksi; ACKTR:n oma arvo voi olla None
+        self.normalize_advantage = normalize_advantage
 
     # ------------------------------------------------------------------
     # Asetus
     # ------------------------------------------------------------------
+
+    def save(self, *args, **kwargs) -> None:
+        # Merkki: checkpointin normalize_advantage on ACKTR:n oma arvo (ks. _setup_model)
+        self._normalize_advantage_saved = True
+        super().save(*args, **kwargs)
 
     def _check_trunk_layout(self) -> None:
         """Varmista että toteutunut runkoasettelu vastaa pyydettyä.
@@ -1757,6 +1768,11 @@ class ACKTR(A2C):
                 )
 
     def _setup_model(self) -> None:
+        # Ennen normalize_advantage-optiota tallennetuissa checkpointeissa on
+        # A2C:n kiinteä False; palautetaan niille alkuperäinen SB2-käyttäytyminen.
+        if self.normalize_advantage is False and not self.__dict__.get("_normalize_advantage_saved", False):
+            self.normalize_advantage = None
+
         # Irrota edellisen K-FAC-optimizerin hookit ennen kuin policy korvataan,
         # muuten vanha optimizer pitää vanhan policyn hengissä hookkiensa kautta.
         previous_optimizer = getattr(getattr(self, "policy", None), "optimizer", None)
@@ -1950,8 +1966,10 @@ class ACKTR(A2C):
     def train(self) -> None:
         self.policy.set_training_mode(True)
         optimizer = self.policy.optimizer
-        # SB2 normalisoi advantaget vain jatkuville action spaceille.
-        normalize_advantage = isinstance(self.action_space, spaces.Box)
+        # SB2 normalisoi advantaget vain jatkuville action spaceille (None).
+        normalize_advantage = self.normalize_advantage
+        if normalize_advantage is None:
+            normalize_advantage = isinstance(self.action_space, spaces.Box)
 
         last_policy_loss = None
         last_value_loss = None

@@ -160,3 +160,53 @@ def test_acktr_head_mask_save_load(tmp_path):
     assert loaded.head_mask_key == "head_mask"
     assert type(loaded.rollout_buffer).__name__ == "HeadMaskRolloutBuffer"
     loaded.learn(8 * 2 * 2, reset_num_timesteps=False)
+
+
+def _train_with_scaled_advantages(env_fn, normalize_advantage, scale):
+    env = make_vec_env(env_fn, n_envs=2, seed=0)
+    model = ACKTR("MlpPolicy", env, n_steps=8, net_arch=(16,), cold_iter=2, seed=0, normalize_advantage=normalize_advantage)
+    train = model.train
+
+    def scaled_train():
+        model.rollout_buffer.advantages *= scale
+        train()
+
+    model.train = scaled_train
+    model.learn(8 * 2 * 6)
+    return model.policy.state_dict()
+
+
+def _same_params(a, b):
+    return all(th.allclose(x, y, atol=1e-5) for x, y in zip(a.values(), b.values()))
+
+
+@pytest.mark.parametrize(
+    "env_fn, normalize_advantage, invariant",
+    [
+        (lambda: IdentityEnv(4), True, True),
+        (lambda: IdentityEnv(4), None, False),
+        (lambda: IdentityEnvMultiDiscrete(3), True, True),
+        (lambda: IdentityEnvBox(-1, 1), None, True),
+        (lambda: IdentityEnvBox(-1, 1), False, False),
+    ],
+    ids=["discrete-true", "discrete-default", "multidiscrete-true", "box-default", "box-false"],
+)
+def test_acktr_normalize_advantage(env_fn, normalize_advantage, invariant):
+    # Normalized advantages make the update independent of the advantage scale.
+    plain = _train_with_scaled_advantages(env_fn, normalize_advantage, 1.0)
+    scaled = _train_with_scaled_advantages(env_fn, normalize_advantage, 1000.0)
+    assert _same_params(plain, scaled) == invariant
+
+
+def test_acktr_normalize_advantage_save_load(tmp_path):
+    env = make_vec_env("CartPole-v1", n_envs=1, seed=0)
+    for value in (True, False, None):
+        model = ACKTR("MlpPolicy", env, n_steps=4, net_arch=(8,), normalize_advantage=value)
+        model.save(tmp_path / "model.zip")
+        assert ACKTR.load(tmp_path / "model.zip", env=env).normalize_advantage is value
+
+    # A checkpoint from before the option stored A2C's fixed False; it loads as the SB2 default.
+    model = ACKTR("MlpPolicy", env, n_steps=4, net_arch=(8,))
+    model.normalize_advantage = False
+    super(ACKTR, model).save(tmp_path / "old.zip")
+    assert ACKTR.load(tmp_path / "old.zip", env=env).normalize_advantage is None
