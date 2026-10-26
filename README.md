@@ -19,12 +19,17 @@ However sometimes these utilities were too niche to be considered for stable-bas
 We hope this allows us to provide reliable implementations following stable-baselines usual standards (consistent style, documentation, etc) beyond the relatively small scope of utilities in the main repository.
 
 
+## ACKTR
+
+This version adds an implementation of ACKTR to SB3. As I am a bit too lazy to check the implementation rigorously, I just forked SB3-contrib. Hence this repo.
+
 
 ## Features
 
 See documentation for the full list of included features.
 
 **RL Algorithms**:
+- [Actor-Critic Kronecker Trust Region (ACKTR)](https://arxiv.org/abs/1708.05144)
 - [Augmented Random Search (ARS)](https://arxiv.org/abs/1803.07055)
 - [Quantile Regression DQN (QR-DQN)](https://arxiv.org/abs/1710.10044)
 - [PPO with invalid action masking (MaskablePPO)](https://arxiv.org/abs/2006.14171)
